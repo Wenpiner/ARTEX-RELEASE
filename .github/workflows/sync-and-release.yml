@@ -1,0 +1,403 @@
+name: sync-and-release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/sync-and-release.yml"
+  schedule:
+    # 每小时整点自动执行一次
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      manual_release_branch:
+        description: "手动指定要编译发布的分支（如 release/v0.7.0），留空则自动检测新分支"
+        required: false
+        type: string
+      rebuild_on_branch_update:
+        description: "当已存在的 release/* 分支有新提交时，是否重新编译发布 Docker"
+        required: false
+        type: boolean
+        default: false
+
+# 避免长时间的 Docker 多架构构建被下一个整点定时任务中断
+concurrency:
+  group: sync-upstream-and-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/BaaRai/ARTEX.git
+
+jobs:
+  # ① 合并上游 main 分支最新代码到当前仓库 main 分支
+  sync-main:
+    name: Sync upstream main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Merge latest upstream/main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_URL"
+          # 清空 checkout 注入的同域认证头，确保匿名拉取公开上游仓库不受 token 权限范围影响
+          git -c http.https://github.com/.extraheader= fetch upstream main
+
+          local_sha="$(git rev-parse HEAD)"
+          upstream_sha="$(git rev-parse upstream/main)"
+
+          if git merge-base --is-ancestor "$upstream_sha" "$local_sha"; then
+            echo "main 分支已包含上游最新提交 ($upstream_sha)，无需合并。"
+            {
+              echo "### Upstream \`main\` Sync"
+              echo "- Status: Up to date (\`${upstream_sha:0:7}\`)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "正在合并 upstream/main ($upstream_sha) -> main ($local_sha)..."
+          # 使用 -X theirs 优先采用上游改动，同时保留当前仓库独有的工作流文件；
+          # 附带 [skip ci] 避免镜像同步重复触发耗时 CI
+          if ! git merge upstream/main --no-ff -X theirs -m "chore(sync): merge upstream/main [skip ci]"; then
+            git merge --abort || true
+            git merge upstream/main --allow-unrelated-histories --no-ff -X theirs -m "chore(sync): merge upstream/main [skip ci]"
+          fi
+
+          merged_sha="$(git rev-parse HEAD)"
+          if ! push_err="$(git push origin HEAD:refs/heads/main 2>&1)"; then
+            echo "$push_err" >&2
+            if grep -qi "workflows" <<< "$push_err"; then
+              echo "::error::上游变更包含 .github/workflows/* 文件，默认 GITHUB_TOKEN 无权推送工作流变更。请在仓库 Settings -> Secrets and variables -> Actions 中配置拥有 repo 和 workflow 权限的 Secret: GH_PAT。"
+            fi
+            exit 1
+          fi
+
+          {
+            echo "### Upstream \`main\` Sync"
+            echo "- Status: Merged \`${upstream_sha:0:7}\` into \`main\` (\`${merged_sha:0:7}\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ② 追踪上游 release/* 分支并检测新发布的分支
+  discover-releases:
+    name: Track & discover release/* branches
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      has_targets: ${{ steps.detect.outputs.has_targets }}
+      targets: ${{ steps.detect.outputs.targets }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream and detect release/* branches
+        id: detect
+        env:
+          MANUAL_BRANCH: ${{ inputs.manual_release_branch || '' }}
+          REBUILD_UPDATED: ${{ inputs.rebuild_on_branch_update || false }}
+          REBUILD_UPDATED_VAR: ${{ vars.REBUILD_ON_RELEASE_UPDATE || 'false' }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL"
+          git -c http.https://github.com/.extraheader= fetch upstream --prune
+          git fetch origin --prune
+
+          rebuild_on_update="false"
+          if [ "$REBUILD_UPDATED" = "true" ] || [ "$REBUILD_UPDATED_VAR" = "true" ]; then
+            rebuild_on_update="true"
+          fi
+
+          mapfile -t upstream_refs < <(
+            git for-each-ref --format='%(refname:lstrip=3) %(objectname)' 'refs/remotes/upstream/release/*'
+          )
+
+          # 计算上游版本号最高的稳定 release/* 分支，仅该分支打 latest 标签
+          latest_branch=""
+          if [ "${#upstream_refs[@]}" -gt 0 ]; then
+            stable_candidates=()
+            all_candidates=()
+            for entry in "${upstream_refs[@]}"; do
+              b="${entry%% *}"
+              ver="${b#release/}"
+              norm="${ver#v}"
+              all_candidates+=("${norm}"$'\t'"${b}")
+              if [[ ! "$norm" =~ -(alpha|beta|rc|dev|preview) ]]; then
+                stable_candidates+=("${norm}"$'\t'"${b}")
+              fi
+            done
+            if [ "${#stable_candidates[@]}" -gt 0 ]; then
+              latest_branch="$(printf '%s\n' "${stable_candidates[@]}" | sort -t $'\t' -k1,1V | tail -n1 | cut -f2)"
+            else
+              latest_branch="$(printf '%s\n' "${all_candidates[@]}" | sort -t $'\t' -k1,1V | tail -n1 | cut -f2)"
+            fi
+          fi
+          echo "上游最新 release 分支: ${latest_branch:-<none>}"
+
+          targets_json="[]"
+          synced_existing=0
+
+          for entry in "${upstream_refs[@]}"; do
+            [ -n "$entry" ] || continue
+            branch="${entry%% *}"
+            upstream_sha="${entry##* }"
+            is_latest="false"
+            if [ "$branch" = "$latest_branch" ]; then
+              is_latest="true"
+            fi
+
+            if ! git show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+              echo "发现新的上游发布分支: ${branch} (${upstream_sha})"
+              # 注意：待 Docker 编译并发布成功后，再由下游任务推送创建 origin/${branch}，
+              # 这样若编译偶发失败，下一小时定时任务会自动重试而不会漏发镜像。
+              targets_json="$(jq -cn \
+                --argjson arr "$targets_json" \
+                --arg branch "$branch" \
+                --arg sha "$upstream_sha" \
+                --arg version "${branch#release/}" \
+                --arg is_latest "$is_latest" \
+                --arg force_build "false" \
+                '$arr + [{branch: $branch, sha: $sha, version: $version, is_latest: $is_latest, force_build: $force_build}]')"
+            else
+              origin_sha="$(git rev-parse "refs/remotes/origin/${branch}")"
+              if [ "$origin_sha" != "$upstream_sha" ]; then
+                if [ "$rebuild_on_update" = "true" ]; then
+                  echo "已存在的分支 ${branch} 有更新 (${origin_sha:0:7} -> ${upstream_sha:0:7})，加入重编队列。"
+                  targets_json="$(jq -cn \
+                    --argjson arr "$targets_json" \
+                    --arg branch "$branch" \
+                    --arg sha "$upstream_sha" \
+                    --arg version "${branch#release/}" \
+                    --arg is_latest "$is_latest" \
+                    --arg force_build "true" \
+                    '$arr + [{branch: $branch, sha: $sha, version: $version, is_latest: $is_latest, force_build: $force_build}]')"
+                else
+                  echo "同步更新已追踪分支 ${branch}: ${origin_sha:0:7} -> ${upstream_sha:0:7}"
+                  if git push origin "${upstream_sha}:refs/heads/${branch}" --force; then
+                    synced_existing=$((synced_existing + 1))
+                  else
+                    echo "::warning::无法更新分支 ${branch}（若包含 .github/workflows/* 变更，请配置 GH_PAT Secret）。"
+                  fi
+                fi
+              fi
+            fi
+          done
+
+          # 处理手动指定的分支
+          if [ -n "$MANUAL_BRANCH" ]; then
+            manual="$MANUAL_BRANCH"
+            if [[ "$manual" != release/* ]]; then
+              manual="release/${manual}"
+            fi
+            if git show-ref --verify --quiet "refs/remotes/upstream/${manual}"; then
+              manual_sha="$(git rev-parse "refs/remotes/upstream/${manual}")"
+            elif git show-ref --verify --quiet "refs/remotes/origin/${manual}"; then
+              manual_sha="$(git rev-parse "refs/remotes/origin/${manual}")"
+            else
+              echo "::error::未在上游或当前仓库找到分支 ${manual}"
+              exit 1
+            fi
+            is_latest="false"
+            if [ "$manual" = "$latest_branch" ]; then
+              is_latest="true"
+            fi
+            # 去重后追加并强制编译
+            targets_json="$(jq -cn \
+              --argjson arr "$targets_json" \
+              --arg branch "$manual" \
+              --arg sha "$manual_sha" \
+              --arg version "${manual#release/}" \
+              --arg is_latest "$is_latest" \
+              '([ $arr[] | select(.branch != $branch) ]) + [{branch: $branch, sha: $sha, version: $version, is_latest: $is_latest, force_build: "true"}]')"
+          fi
+
+          count="$(jq 'length' <<< "$targets_json")"
+          if [ "$count" -gt 0 ]; then
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "targets=${targets_json}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Upstream \`release/*\` Tracking"
+            echo "- Upstream \`release/*\` branches found: ${#upstream_refs[@]}"
+            echo "- Existing branches updated: ${synced_existing}"
+            echo "- Branches queued for Docker build: ${count}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ③ 编译新 release/* 分支的 Docker 镜像并发布至 GitHub Packages (ghcr.io)
+  publish-docker:
+    name: Build & Push (${{ matrix.target.branch }})
+    needs: discover-releases
+    if: ${{ needs.discover-releases.outputs.has_targets == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        target: ${{ fromJson(needs.discover-releases.outputs.targets) }}
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Checkout target release branch commit
+        env:
+          BRANCH_NAME: ${{ matrix.target.branch }}
+          TARGET_SHA: ${{ matrix.target.sha }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL"
+          git -c http.https://github.com/.extraheader= fetch upstream "$BRANCH_NAME" || true
+          git checkout --detach "$TARGET_SHA"
+          [ -f Dockerfile ] || { echo "::error::分支 ${BRANCH_NAME} 中不存在 Dockerfile"; exit 1; }
+          # 对齐 go.mod 的精确 Go 版本，防止部分历史分支（如 release/v0.7.0）中浮动的 golang:1.26-bookworm 滞后导致 GOTOOLCHAIN=local 报错
+          go_ver="$(awk '/^go [0-9]+\.[0-9]+\.[0-9]+/ {print $2; exit}' go.mod || true)"
+          if [ -n "$go_ver" ]; then
+            sed -i -E "s|golang:[0-9]+\.[0-9]+-bookworm|golang:${go_ver}-bookworm|g" Dockerfile
+          fi
+
+      - name: Compute GHCR tags
+        id: prep
+        env:
+          IMAGE_REPO: ${{ vars.GHCR_IMAGE_NAME || github.repository }}
+          DOCKER_PLATFORMS: ${{ vars.DOCKER_PLATFORMS || 'linux/amd64,linux/arm64' }}
+          RAW_VERSION: ${{ matrix.target.version }}
+          IS_LATEST: ${{ matrix.target.is_latest }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/$(printf '%s' "$IMAGE_REPO" | tr '[:upper:]' '[:lower:]')"
+          safe_ver="$(printf '%s' "$RAW_VERSION" | tr '/' '-' | sed 's/[^a-zA-Z0-9._-]/-/g')"
+          clean_ver="${safe_ver#v}"
+
+          platforms="$DOCKER_PLATFORMS"
+          if [[ "$platforms" == *"linux/arm64"* ]] && ! grep -q 'linux-arm64' Dockerfile; then
+            echo "::notice::当前分支 Dockerfile 未包含 arm64 bbot 适配补丁，自动降级为 linux/amd64 构建。"
+            platforms="linux/amd64"
+          fi
+
+          tags=()
+          if [[ "$safe_ver" =~ ^v[0-9] ]]; then
+            tags+=("${image}:${clean_ver}")
+            tags+=("${image}:${safe_ver}")
+            primary_tag="${image}:${clean_ver}"
+          elif [[ "$safe_ver" =~ ^[0-9] ]]; then
+            tags+=("${image}:${clean_ver}")
+            tags+=("${image}:v${clean_ver}")
+            primary_tag="${image}:${clean_ver}"
+          else
+            tags+=("${image}:${safe_ver}")
+            primary_tag="${image}:${safe_ver}"
+          fi
+
+          if [ "$IS_LATEST" = "true" ]; then
+            tags+=("${image}:latest")
+          fi
+
+          {
+            echo "image=${image}"
+            echo "platforms=${platforms}"
+            echo "artex_version=${clean_ver}"
+            echo "primary_tag=${primary_tag}"
+            echo "tags<<EOF"
+            printf '%s\n' "${tags[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if image tag already exists on GHCR
+        id: check_ghcr
+        env:
+          PRIMARY_TAG: ${{ steps.prep.outputs.primary_tag }}
+          FORCE_BUILD: ${{ matrix.target.force_build }}
+        run: |
+          if [ "$FORCE_BUILD" = "true" ]; then
+            echo "skip_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if docker buildx imagetools inspect "$PRIMARY_TAG" >/dev/null 2>&1; then
+            echo "镜像 ${PRIMARY_TAG} 已存在于 GHCR，跳过重复构建。"
+            echo "skip_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU
+        if: steps.check_ghcr.outputs.skip_build != 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.check_ghcr.outputs.skip_build != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image to GitHub Packages
+        if: steps.check_ghcr.outputs.skip_build != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ steps.prep.outputs.platforms }}
+          push: true
+          tags: ${{ steps.prep.outputs.tags }}
+          build-args: |
+            ARTEX_VERSION=${{ steps.prep.outputs.artex_version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ matrix.target.sha }}
+            org.opencontainers.image.version=${{ steps.prep.outputs.artex_version }}
+            org.opencontainers.image.title=ARTEX
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: Push tracked release branch to origin
+        env:
+          BRANCH_NAME: ${{ matrix.target.branch }}
+          TARGET_SHA: ${{ matrix.target.sha }}
+        run: |
+          if ! push_err="$(git push origin "${TARGET_SHA}:refs/heads/${BRANCH_NAME}" --force 2>&1)"; then
+            echo "$push_err" >&2
+            echo "::warning::Docker 镜像已发布成功，但同步分支 ${BRANCH_NAME} 到 origin 失败。若该分支包含 .github/workflows/* 变更，请添加拥有 repo 和 workflow 权限的 Secret: GH_PAT。"
+          fi
+
+      - name: Write publish summary
+        env:
+          BRANCH_NAME: ${{ matrix.target.branch }}
+          TARGET_SHA: ${{ matrix.target.sha }}
+          TAGS: ${{ steps.prep.outputs.tags }}
+        run: |
+          {
+            echo "### Published \`${BRANCH_NAME}\` (\`${TARGET_SHA:0:7}\`)"
+            echo '```text'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
