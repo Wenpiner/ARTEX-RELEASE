@@ -76,11 +76,17 @@ jobs:
 
           merged_sha="$(git rev-parse HEAD)"
           if ! push_err="$(git push origin HEAD:refs/heads/main 2>&1)"; then
-            echo "$push_err" >&2
             if grep -qi "workflows" <<< "$push_err"; then
-              echo "::error::上游变更包含 .github/workflows/* 文件，默认 GITHUB_TOKEN 无权推送工作流变更。请在仓库 Settings -> Secrets and variables -> Actions 中配置拥有 repo 和 workflow 权限的 Secret: GH_PAT。"
+              echo "::warning::上游包含 .github/workflows/* 变更，默认 GITHUB_TOKEN 无权更新工作流文件；已自动保留当前 .github/workflows 目录并同步其余全部上游代码（如需同步工作流文件，请配置拥有 repo 和 workflow 权限的 Secret: GH_PAT）。"
+              git rm -rf --ignore-unmatch .github/workflows
+              git checkout "$local_sha" -- .github/workflows
+              git commit --amend --allow-empty -m "chore(sync): merge upstream/main [skip ci]"
+              merged_sha="$(git rev-parse HEAD)"
+              git push origin HEAD:refs/heads/main
+            else
+              echo "$push_err" >&2
+              exit 1
             fi
-            exit 1
           fi
 
           {
