@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -500,7 +501,12 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	for _, g := range goals {
 		var p map[string]any
 		_ = json.Unmarshal(g.Payload, &p)
-		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": p["text"]})
+		text, _ := p["text"].(string)
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": text})
 	}
 	out["goals"] = gsum
 	// hints: strategic hints attached to the graph by the human/main agent via
@@ -680,7 +686,16 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// the original task (root) so the planner always has it, not just the
 	// decomposed goals.
 	if description, goal, err := t.ts.Root(); err == nil {
-		out["task"] = map[string]any{"description": description, "goal": goal}
+		task := map[string]any{}
+		if d := strings.TrimSpace(description); d != "" {
+			task["description"] = d
+		}
+		if g := strings.TrimSpace(goal); g != "" {
+			task["goal"] = g
+		}
+		if len(task) > 0 {
+			out["task"] = task
+		}
 	}
 	// Direct source tasks are a live, read-only blackboard view. Keep their
 	// summaries in a separate field so their intents never enter this task's
@@ -1164,6 +1179,49 @@ func (t *ToolSet) listFindings() actool.CoreTool {
 // context, so default to the newest page and let the agent page/filter for more.
 const factsPageSize = 20
 
+// toolPageMax is the largest page an agent list tool will return or allocate.
+// list_facts already stops at 100. The same ceiling keeps a model-supplied
+// limit from becoming a slice allocation or an unbounded query.
+const toolPageMax = 100
+
+// toolOffsetMax bounds a model-supplied SQL offset. The page size is already
+// capped; this stops a huge offset from turning one call into a long scan.
+const toolOffsetMax = 1_000_000
+
+// toolPageIndexMax bounds the page number used with a capped page size so the
+// offset multiplication cannot overflow.
+const toolPageIndexMax = 10_000
+
+func clampToolLimit(n, def int) int {
+	if n <= 0 {
+		return def
+	}
+	if n > toolPageMax {
+		return toolPageMax
+	}
+	return n
+}
+
+func clampToolOffset(n int) int {
+	if n < 0 {
+		return 0
+	}
+	if n > toolOffsetMax {
+		return toolOffsetMax
+	}
+	return n
+}
+
+func clampToolPage(n int) int {
+	if n <= 0 {
+		return 1
+	}
+	if n > toolPageIndexMax {
+		return toolPageIndexMax
+	}
+	return n
+}
+
 func (t *ToolSet) listFacts() actool.CoreTool {
 	return t.readExpTool("list_facts", "Page through the [exploration facts/conclusions] of this task and directly related tasks, newest first (compact: id+summary+state+origin+source; origin is the writer, source the declared source of the content; overlong summaries are truncated — full text via node_detail(id)). All parameters optional: limit (default 20, max 100), before (cursor; pass the previous page's next_before for an older page; omit/0 = the newest page), q (filter by summary keyword). Returns {facts, total, has_more, next_before}: total is the filtered count; when has_more=true, keep paging with next_before. Related-task entries carry source_task_id/inherited=true and are read-only. For findings see list_findings.",
 		obj(map[string]any{
@@ -1559,16 +1617,23 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if !findingTrafficBindingEnabled() {
 			a.TrafficRefs, a.EvidenceHintID = nil, nil
 		}
-		// A model routinely emits "evidence_hint_id": 0 meaning "absent" — the field
-		// is optional, so 0 must mean "no hint", not an error. A hint id that does
-		// not resolve to a local hint node (passing a fact node number is the common
-		// case) must not sink an otherwise complete finding either: when explicit
-		// traffic_refs are present they are sufficient on their own, so degrade to
-		// them and keep the finding. Only a call with neither usable hint nor usable
-		// refs fails.
-		refs, err := t.findingRefsFromHint(pid(a.EvidenceHintID), a.TrafficRefs)
+		// A model routinely emits "evidence_hint_id": 0 (or null/"") meaning "absent",
+		// or passes a stale/non-hint node ID. Because evidence_hint_id is optional and
+		// findings without bound traffic are valid (the report agent binds traffic later),
+		// a stale or non-local hint ID must degrade cleanly to whatever valid explicit
+		// traffic_refs were passed (including none) instead of discarding the finding (#550).
+		hintID := pid(a.EvidenceHintID)
+		var ignoredHintNote string
+		refs, err := t.findingRefsFromHint(hintID, a.TrafficRefs)
 		if err != nil {
-			if degraded, derr := db.NormalizeTrafficRefs(a.TrafficRefs); derr == nil && len(degraded) > 0 {
+			if errors.Is(err, errEvidenceHintNotFound) {
+				degraded, derr := db.NormalizeTrafficRefs(a.TrafficRefs)
+				if derr != nil {
+					return actool.Errorf(derr.Error()), nil
+				}
+				refs = degraded
+				ignoredHintNote = fmt.Sprintf("Ignored stale or non-local evidence_hint_id=%d; finding recorded without hint references.", hintID)
+			} else if degraded, derr := db.NormalizeTrafficRefs(a.TrafficRefs); derr == nil && len(degraded) > 0 {
 				refs = degraded
 			} else {
 				return actool.Errorf(err.Error()), nil
@@ -1587,6 +1652,20 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		// retry hits the same check and is suppressed again.
 		if a.ForceRegister {
 			slog.Info("[triage] override: force_register set, registering without duplicate check", "candidate", a.Name)
+		} else if dup, ok := t.fingerprintDuplicate(input); ok {
+			res := map[string]any{
+				"duplicate_of_finding_id":      dup.FindingID,
+				"duplicate_of_finding_node_id": dup.NodeID,
+				"dedup_source":                 "fingerprint",
+				"fingerprint":                  dup.Fingerprint,
+				"evidence_status":              "duplicate_not_registered",
+				"note": fmt.Sprintf("Deterministic fingerprint (%s) matched already registered finding_id %d (exploration node %d), so no new finding was created. "+
+					"To extend that finding with new evidence, call update_finding_report with finding_id=%d (it addresses the NODE id, not the findings-table id). "+
+					"If the new evidence is in fact a distinct defect (different endpoint, parameter or root cause), call report_finding again with force_register=true.",
+					dup.Fingerprint, dup.FindingID, dup.NodeID, dup.NodeID),
+			}
+			raw, _ := json.Marshal(res)
+			return actool.Text(fmt.Sprintf("finding matched existing finding_id %d (node %d, fingerprint %s) — not registered again\n%s", dup.FindingID, dup.NodeID, dup.Fingerprint, raw)), nil
 		} else if ans, ok := t.triageDuplicate(ctx, input); ok && triageDuplicateHit(ans) {
 			res := map[string]any{
 				"duplicate_of_finding_id":      ans.DuplicateOf,
@@ -1637,6 +1716,13 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			result.EvidenceNote = "Finding saved without bound traffic (recorded and visible, but cannot close a goal via prove_goal until verified traffic matching its asset is bound). Bind verified HTTP traffic via bind_finding_traffic or the findings page; for non-HTTP goals, prove the goal with an observed tool_output fact. Do not create the finding again."
 			if !findingTrafficBindingEnabled() {
 				result.EvidenceNote = "Finding saved without bound traffic. Automatic agent traffic binding is off: this finding remains visible but cannot close a goal unless traffic is bound manually later (or a non-HTTP goal is proven with an observed tool_output fact)."
+			}
+		}
+		if ignoredHintNote != "" {
+			if result.EvidenceNote != "" {
+				result.EvidenceNote = ignoredHintNote + " " + result.EvidenceNote
+			} else {
+				result.EvidenceNote = ignoredHintNote
 			}
 		}
 		raw, _ := json.Marshal(result)
@@ -2522,7 +2608,7 @@ func (t *ToolSet) listWorkerTraces() actool.CoreTool {
 			"Only executed ones are listed (running/done/exhausted/blocked/stopped), not the not-yet-run open ones. Note: your task boundary is still the intent you claimed; looking at other works is only for reusing observations/avoiding duplicate work.",
 		obj(map[string]any{
 			"q":     str("filter by summary keyword (optional)"),
-			"limit": intp("return cap, default 50 (optional)"),
+			"limit": intp("return cap, default 50, max 100 (optional)"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -2530,10 +2616,7 @@ func (t *ToolSet) listWorkerTraces() actool.CoreTool {
 				Limit int    `json:"limit"`
 			}
 			_ = json.Unmarshal(in, &a)
-			limit := a.Limit
-			if limit <= 0 {
-				limit = 50
-			}
+			limit := clampToolLimit(a.Limit, 50)
 			all, err := t.ts.ListByKindWithSources(db.KindIntent, 500)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -2571,7 +2654,7 @@ func (t *ToolSet) listWorkerTraces() actool.CoreTool {
 // PlannerTools is the read + intent-generation + goal-judgement tool set.
 func (t *ToolSet) PlannerTools() []actool.CoreTool {
 	return []actool.CoreTool{
-		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(),
+		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(), t.knowledgeLookup(),
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
